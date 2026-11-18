@@ -1,5 +1,5 @@
 import { data } from "react-router";
-import { eq, and } from "drizzle-orm";
+import { eq, and, desc } from "drizzle-orm";
 import { db } from "~/db";
 import {
   UserRole,
@@ -11,6 +11,7 @@ import {
 import { getCurrentUserId } from "~/lib/session";
 import { resolveCountry } from "~/lib/country.server";
 import { checkPppAccess } from "~/lib/ppp";
+import { isActiveEnrollment } from "~/lib/enrollments";
 
 function getUserById(id: number) {
   return db.select().from(users).where(eq(users.id, id)).get();
@@ -25,7 +26,12 @@ function findEnrollment(userId: number, courseId: number) {
     .select()
     .from(enrollments)
     .where(
-      and(eq(enrollments.userId, userId), eq(enrollments.courseId, courseId))
+      and(
+        eq(enrollments.userId, userId),
+        eq(enrollments.courseId, courseId),
+        // Access ends when a Refund is Approved, even though the row is kept.
+        isActiveEnrollment()
+      )
     )
     .get();
 }
@@ -35,10 +41,13 @@ function isUserEnrolled(userId: number, courseId: number) {
 }
 
 function findPurchase(userId: number, courseId: number) {
+  // The latest purchase: after a Refund and a fresh purchase, the new one's
+  // country is the one that applies.
   return db
     .select()
     .from(purchases)
     .where(and(eq(purchases.userId, userId), eq(purchases.courseId, courseId)))
+    .orderBy(desc(purchases.createdAt), desc(purchases.id))
     .get();
 }
 

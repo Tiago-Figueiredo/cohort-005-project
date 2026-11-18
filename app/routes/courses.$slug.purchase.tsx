@@ -20,6 +20,7 @@ import {
   TeamMemberRole,
 } from "~/db/schema";
 import { eq, and, or, sql } from "drizzle-orm";
+import { isActiveEnrollment } from "~/lib/enrollments";
 import crypto from "crypto";
 import { Card, CardContent } from "~/components/ui/card";
 import { Button } from "~/components/ui/button";
@@ -123,7 +124,11 @@ function findEnrollment(userId: number, courseId: number) {
     .select()
     .from(enrollments)
     .where(
-      and(eq(enrollments.userId, userId), eq(enrollments.courseId, courseId))
+      and(
+        eq(enrollments.userId, userId),
+        eq(enrollments.courseId, courseId),
+        isActiveEnrollment()
+      )
     )
     .get();
 }
@@ -132,11 +137,41 @@ function isUserEnrolled(userId: number, courseId: number) {
   return !!findEnrollment(userId, courseId);
 }
 
+/**
+ * Buying a course again after a Refund restores the Revoked enrollment
+ * rather than adding a second one, so the learner's history and Progress
+ * carry straight on.
+ */
+function restoreOrCreateEnrollment(userId: number, courseId: number) {
+  const revoked = db
+    .select()
+    .from(enrollments)
+    .where(
+      and(eq(enrollments.userId, userId), eq(enrollments.courseId, courseId))
+    )
+    .get();
+
+  if (revoked) {
+    return db
+      .update(enrollments)
+      .set({ revokedAt: null })
+      .where(eq(enrollments.id, revoked.id))
+      .returning()
+      .get();
+  }
+
+  return db
+    .insert(enrollments)
+    .values({ userId, courseId })
+    .returning()
+    .get();
+}
+
 function getEnrollmentCountForCourse(courseId: number) {
   const result = db
     .select({ count: sql<number>`count(*)` })
     .from(enrollments)
-    .where(eq(enrollments.courseId, courseId))
+    .where(and(eq(enrollments.courseId, courseId), isActiveEnrollment()))
     .get();
 
   return result?.count ?? 0;
@@ -164,11 +199,7 @@ function enrollUser(
     }
   }
 
-  const enrollment = db
-    .insert(enrollments)
-    .values({ userId, courseId })
-    .returning()
-    .get();
+  const enrollment = restoreOrCreateEnrollment(userId, courseId);
 
   if (sendEmail) {
     // Would send welcome email here

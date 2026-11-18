@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { eq, gte, isNotNull, isNull, sql, type SQL } from "drizzle-orm";
+import { and, desc, eq, gte, isNotNull, isNull, sql, type SQL } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import type { SQLiteTable } from "drizzle-orm/sqlite-core";
 import { migrate } from "drizzle-orm/better-sqlite3/migrator";
@@ -12,6 +12,7 @@ import {
   LessonProgressStatus,
   QuestionType,
   TeamMemberRole,
+  RefundStatus,
 } from "../app/db/schema";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -190,7 +191,7 @@ async function seed() {
       },
       {
         name: "Liam Thompson",
-        email: "liam.thompson@student.dev",
+        email: "liam@example.com",
         role: UserRole.Student,
         avatarUrl: "https://api.dicebear.com/9.x/avataaars/svg?seed=liam",
         createdAt: daysAgo(30),
@@ -386,7 +387,7 @@ By the end of this course, you'll understand why TypeScript has become the defau
       categoryId: catBySlug["programming"].id,
       status: CourseStatus.Published,
       coverImageUrl: "/images/course-typescript.svg",
-      price: 4999,
+      price: 7900,
       createdAt: daysAgo(355),
       updatedAt: daysAgo(10),
     })
@@ -2229,7 +2230,7 @@ This course is still in draft while the cluster examples are rewritten against t
     .values({
       userId: students[0].id, // Emma — bought course 1 individually
       courseId: course1.id,
-      amountPaid: 4999,
+      amountPaid: 7900,
       country: "US",
       createdAt: daysAgo(50),
     })
@@ -2260,7 +2261,7 @@ This course is still in draft while the cluster examples are rewritten against t
     .values({
       userId: students[2].id, // Olivia — bought course 1 individually
       courseId: course1.id,
-      amountPaid: 4999,
+      amountPaid: 7900,
       country: "US",
       createdAt: daysAgo(35),
     })
@@ -2270,7 +2271,7 @@ This course is still in draft while the cluster examples are rewritten against t
     .values({
       userId: students[4].id, // Sophia — bought course 1 individually
       courseId: course1.id,
-      amountPaid: 4999,
+      amountPaid: 7900,
       country: "US",
       createdAt: daysAgo(15),
     })
@@ -2346,7 +2347,7 @@ This course is still in draft while the cluster examples are rewritten against t
 
   db.update(schema.coupons)
     .set({
-      redeemedByUserId: studentByEmail("liam.thompson@student.dev").id,
+      redeemedByUserId: studentByEmail("liam@example.com").id,
       redeemedAt: daysAgo(25),
     })
     .where(eq(schema.coupons.id, seededCoupons[1].id))
@@ -2723,6 +2724,55 @@ This course is still in draft while the cluster examples are rewritten against t
     []
   );
 
+  // ─── Liam's Purchase ───
+  // One learner part-way through a recent purchase, with no request raised, so
+  // the course page offers "Request a refund". The dates count back from
+  // today, so the fourteen-day refund window is still open whenever you seed.
+
+  const liam = studentByEmail("liam@example.com");
+  db
+    .insert(schema.purchases)
+    .values({
+      userId: liam.id,
+      courseId: course1.id,
+      amountPaid: 7900,
+      country: null,
+      createdAt: daysAgo(9),
+    })
+    .run();
+  db.insert(schema.enrollments)
+    .values({
+      userId: liam.id,
+      courseId: course1.id,
+      enrolledAt: daysAgo(9),
+    })
+    .run();
+  db.insert(schema.lessonProgress)
+    .values([
+      ...course1LessonIds.slice(0, 3).map((lessonId, i) => ({
+        userId: liam.id,
+        lessonId,
+        status: LessonProgressStatus.Completed,
+        completedAt: daysAgo(8 - i),
+      })),
+      {
+        userId: liam.id,
+        lessonId: course1LessonIds[3],
+        status: LessonProgressStatus.InProgress,
+        completedAt: null,
+      },
+    ])
+    .run();
+  db.insert(schema.courseRatings)
+    .values({
+      userId: liam.id,
+      courseId: course1.id,
+      rating: 4,
+      createdAt: daysAgo(6),
+      updatedAt: daysAgo(6),
+    })
+    .run();
+
   // ─── Flush watch events ───
   // Batched: the heartbeat makes these by far the largest table, and one
   // statement per row would dominate the seed's runtime.
@@ -2735,6 +2785,90 @@ This course is still in draft while the cluster examples are rewritten against t
   }
 
   console.log(`Created ${watchEventRows.length} video watch events.`);
+
+  // ─── Refunds ───
+  // Enough Refunds for the admin approval screen and the analytics deduction
+  // to have something to show: one clean request, one carrying a Refund
+  // Warning, and one already Approved. Purchases are picked by learner and
+  // course, never by id. Runs after the watch events are flushed, because the
+  // warning is measured from them. Liam is left alone so the learner's
+  // "Request a refund" button is still on offer.
+
+  function latestPersonalPurchase(email: string, courseId: number) {
+    const learner = studentByEmail(email);
+    const purchase = db
+      .select()
+      .from(schema.purchases)
+      .where(
+        and(
+          eq(schema.purchases.userId, learner.id),
+          eq(schema.purchases.courseId, courseId)
+        )
+      )
+      .orderBy(desc(schema.purchases.createdAt))
+      .get();
+    if (!purchase) {
+      throw new Error(`Seed expected ${email} to have bought course ${courseId}`);
+    }
+    return purchase;
+  }
+
+  // 30% through, under 2h watched: nothing for the admin to weigh.
+  const noahPurchase = latestPersonalPurchase(
+    "noah.blackwood@student.dev",
+    course2.id
+  );
+  db.insert(schema.refunds)
+    .values({
+      purchaseId: noahPurchase.id,
+      status: RefundStatus.Requested,
+      reason:
+        "The course moves faster than I expected and I don't have the background for it yet.",
+      requestedAt: daysAgo(2),
+    })
+    .run();
+
+  // Every lesson completed: a Refund Warning the admin must address.
+  const anikaPurchase = latestPersonalPurchase(
+    "anika.bose@student.dev",
+    course3.id
+  );
+  db.insert(schema.refunds)
+    .values({
+      purchaseId: anikaPurchase.id,
+      status: RefundStatus.Requested,
+      reason:
+        "I finished it, but the content was much more basic than the description suggested.",
+      requestedAt: daysAgo(0),
+    })
+    .run();
+
+  // Approved yesterday: Access Revoked, Progress kept, and a deduction in the
+  // instructor's analytics dated on the approval.
+  const elifPurchase = latestPersonalPurchase(
+    "elif.demir@student.dev",
+    course1.id
+  );
+  db.insert(schema.refunds)
+    .values({
+      purchaseId: elifPurchase.id,
+      status: RefundStatus.Approved,
+      reason: "I bought the wrong course by mistake — I meant the advanced one.",
+      amountRefunded: elifPurchase.amountPaid,
+      requestedAt: daysAgo(1),
+      resolvedAt: daysAgo(1),
+      resolvedByUserId: admin.id,
+    })
+    .run();
+  db.update(schema.enrollments)
+    .set({ revokedAt: daysAgo(1) })
+    .where(
+      and(
+        eq(schema.enrollments.userId, elifPurchase.userId),
+        eq(schema.enrollments.courseId, course1.id)
+      )
+    )
+    .run();
 
   // ─── Summary ───
 
@@ -2762,7 +2896,12 @@ This course is still in draft while the cluster examples are rewritten against t
   console.log(
     `  Quizzes: ${countRows(schema.quizzes)}, attempts: ${countRows(schema.quizAttempts)}`
   );
-  console.log(`  Enrollments: ${countRows(schema.enrollments)}`);
+  console.log(
+    `  Enrollments: ${countRows(schema.enrollments)} (${countRows(schema.enrollments, isNotNull(schema.enrollments.revokedAt))} revoked)`
+  );
+  console.log(
+    `  Refunds: ${countRows(schema.refunds)} (${countRows(schema.refunds, eq(schema.refunds.status, RefundStatus.Requested))} requested, ${countRows(schema.refunds, eq(schema.refunds.status, RefundStatus.Approved))} approved)`
+  );
   console.log(`  Course ratings: ${countRows(schema.courseRatings)}`);
   console.log(`  Lesson comments: ${countRows(schema.comments)}`);
   console.log(

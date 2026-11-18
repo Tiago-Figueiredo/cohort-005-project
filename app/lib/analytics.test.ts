@@ -9,6 +9,7 @@ import {
   rangeStart,
   parseAnalyticsRange,
   splitRevenue,
+  splitRevenueAfterRefunds,
 } from "./analytics";
 
 describe("analytics config", () => {
@@ -75,6 +76,31 @@ describe("analytics config", () => {
         feeCents: 0,
         netCents: 0,
       });
+    });
+  });
+
+  describe("splitRevenueAfterRefunds", () => {
+    it("leaves gross as sold and takes refunds out of fee and net proportionally", () => {
+      expect(splitRevenueAfterRefunds(10000, 2500)).toEqual({
+        grossCents: 10000,
+        refundsCents: 2500,
+        feeCents: 1500,
+        netCents: 6000,
+      });
+    });
+
+    it("can go negative in a period with refunds and no sales", () => {
+      expect(splitRevenueAfterRefunds(0, 1000)).toEqual({
+        grossCents: 0,
+        refundsCents: 1000,
+        feeCents: -200,
+        netCents: -800,
+      });
+    });
+
+    it("matches splitRevenue when nothing was refunded", () => {
+      const { grossCents, feeCents, netCents } = splitRevenueAfterRefunds(3333, 0);
+      expect({ grossCents, feeCents, netCents }).toEqual(splitRevenue(3333));
     });
   });
 
