@@ -101,3 +101,23 @@ export function splitRevenue(grossCents: number) {
   const feeCents = Math.round(grossCents * PLATFORM_FEE_RATE);
   return { grossCents, feeCents, netCents: grossCents - feeCents };
 }
+
+/**
+ * Gross as sold, with Approved Refunds taken back out of the fee and the net
+ * in the same proportion as the sale: the platform returns its fee and the
+ * instructor loses only their share. Gross itself is left alone, so a period's
+ * sales never change after the fact; the refunds sit beside it.
+ */
+export function splitRevenueAfterRefunds(
+  grossCents: number,
+  refundsCents: number
+) {
+  const sold = splitRevenue(grossCents);
+  const givenBack = splitRevenue(refundsCents);
+  return {
+    grossCents,
+    refundsCents,
+    feeCents: sold.feeCents - givenBack.feeCents,
+    netCents: sold.netCents - givenBack.netCents,
+  };
+}

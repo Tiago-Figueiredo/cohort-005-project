@@ -13,6 +13,8 @@ import { data } from "react-router";
 import { db } from "~/db";
 import { purchases, coupons, courses, enrollments } from "~/db/schema";
 import { eq, and } from "drizzle-orm";
+import { isActiveEnrollment } from "~/lib/enrollments";
+import { isPurchaseRefunded } from "~/lib/refunds.server";
 
 function getCourseById(id: number) {
   return db.select().from(courses).where(eq(courses.id, id)).get();
@@ -27,7 +29,11 @@ function isUserEnrolled(userId: number, courseId: number) {
     .select()
     .from(enrollments)
     .where(
-      and(eq(enrollments.userId, userId), eq(enrollments.courseId, courseId))
+      and(
+        eq(enrollments.userId, userId),
+        eq(enrollments.courseId, courseId),
+        isActiveEnrollment()
+      )
     )
     .get();
 
@@ -58,7 +64,8 @@ function redeemCoupon(
     .where(
       and(
         eq(enrollments.userId, userId),
-        eq(enrollments.courseId, coupon.courseId)
+        eq(enrollments.courseId, coupon.courseId),
+        isActiveEnrollment()
       )
     )
     .get();
@@ -72,6 +79,11 @@ function redeemCoupon(
     .from(purchases)
     .where(eq(purchases.id, coupon.purchaseId))
     .get();
+
+  // An Approved Refund on a team purchase gives back its unclaimed seats too.
+  if (purchase && isPurchaseRefunded(purchase.id)) {
+    return { ok: false, error: "This seat was refunded and can no longer be redeemed" };
+  }
 
   if (purchase?.country && purchase.country !== userCountry) {
     return {
@@ -89,11 +101,31 @@ function redeemCoupon(
     .where(eq(coupons.id, coupon.id))
     .run();
 
-  const enrollment = db
-    .insert(enrollments)
-    .values({ userId, courseId: coupon.courseId })
-    .returning()
+  // A learner whose own Access was Revoked by a Refund gets that enrollment
+  // back, with their Progress, rather than a second one.
+  const revoked = db
+    .select()
+    .from(enrollments)
+    .where(
+      and(
+        eq(enrollments.userId, userId),
+        eq(enrollments.courseId, coupon.courseId)
+      )
+    )
     .get();
+
+  const enrollment = revoked
+    ? db
+        .update(enrollments)
+        .set({ revokedAt: null })
+        .where(eq(enrollments.id, revoked.id))
+        .returning()
+        .get()
+    : db
+        .insert(enrollments)
+        .values({ userId, courseId: coupon.courseId })
+        .returning()
+        .get();
 
   return { ok: true, enrollment };
 }

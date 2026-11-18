@@ -10,6 +10,7 @@ import {
   eq,
   gte,
   inArray,
+  isNotNull,
   isNull,
   ne,
   notExists,
@@ -17,6 +18,7 @@ import {
   sql,
   sum,
 } from "drizzle-orm";
+import { isActiveEnrollment } from "~/lib/enrollments";
 import { alias, type SQLiteColumn } from "drizzle-orm/sqlite-core";
 import { db } from "~/db";
 import {
@@ -34,9 +36,15 @@ import {
   purchases,
   quizAttempts,
   quizzes,
+  refunds,
+  RefundStatus,
   users,
 } from "~/db/schema";
-import { splitRevenue, type AnalyticsRange } from "~/lib/analytics";
+import {
+  splitRevenue,
+  splitRevenueAfterRefunds,
+  type AnalyticsRange,
+} from "~/lib/analytics";
 import { getDiscountForCountry } from "~/lib/ppp";
 import {
   ANALYTICS_RANGES,
@@ -101,6 +109,7 @@ function parseId(value: string | null): number | null {
 
 type RevenueSummary = {
   grossCents: number;
+  refundsCents: number;
   feeCents: number;
   netCents: number;
   purchaseCount: number;
@@ -221,6 +230,22 @@ function purchaseScope(instructorId: number | null, range: AnalyticsRange) {
   return scopeOn(purchases.createdAt, instructorId, range);
 }
 
+/**
+ * Approved Refunds whose approval falls in the range. Dated by when they were
+ * Approved, not when the purchase was made, so earlier periods never change.
+ * Join refunds → purchases → courses before using it.
+ */
+function approvedRefundScope(
+  instructorId: number | null,
+  range: AnalyticsRange
+) {
+  return and(
+    eq(refunds.status, RefundStatus.Approved),
+    isNotNull(refunds.resolvedAt),
+    scopeOn(refunds.resolvedAt, instructorId, range)
+  );
+}
+
 function sinceRange(dateColumn: SQLiteColumn, range: AnalyticsRange) {
   const start = rangeStart(range);
   return start === null ? undefined : gte(dateColumn, start);
@@ -241,7 +266,12 @@ function getStudentRevenue(
     .from(enrollments)
     .innerJoin(courses, eq(enrollments.courseId, courses.id))
     .innerJoin(users, eq(users.id, enrollments.userId))
-    .where(scopeOn(enrollments.enrolledAt, instructorId, range))
+    .where(
+      and(
+        scopeOn(enrollments.enrolledAt, instructorId, range),
+        isActiveEnrollment()
+      )
+    )
     .orderBy(users.name)
     .all();
 
@@ -364,7 +394,13 @@ function getTopBuyers(
       .selectDistinct({ userId: enrollments.userId })
       .from(enrollments)
       .innerJoin(courses, eq(enrollments.courseId, courses.id))
-      .where(and(inArray(enrollments.userId, buyerIds), ownedBy(instructorId)))
+      .where(
+        and(
+          inArray(enrollments.userId, buyerIds),
+          ownedBy(instructorId),
+          isActiveEnrollment()
+        )
+      )
       .all()
       .map((row) => row.userId)
   );
@@ -454,6 +490,25 @@ function getRevenueOverTime(
     rows.map((row) => [row.bucket, Number(row.gross ?? 0)])
   );
 
+  const refundBucketExpr = sql<string>`substr(${refunds.resolvedAt}, 1, ${
+    granularity === "day" ? 10 : 7
+  })`;
+
+  const refundsByBucket = new Map(
+    db
+      .select({
+        bucket: refundBucketExpr,
+        refunded: sum(refunds.amountRefunded),
+      })
+      .from(refunds)
+      .innerJoin(purchases, eq(refunds.purchaseId, purchases.id))
+      .innerJoin(courses, eq(purchases.courseId, courses.id))
+      .where(approvedRefundScope(instructorId, range))
+      .groupBy(refundBucketExpr)
+      .all()
+      .map((row) => [row.bucket, Number(row.refunded ?? 0)])
+  );
+
   const now = new Date().toISOString();
   // A fixed range always spans its whole window, even before the first sale;
   // all time can only start where the data does.
@@ -464,8 +519,9 @@ function getRevenueOverTime(
     bucketOf(now, granularity),
     granularity
   ).map((bucket) => {
-    const { grossCents, netCents } = splitRevenue(
-      grossByBucket.get(bucket) ?? 0
+    const { grossCents, netCents } = splitRevenueAfterRefunds(
+      grossByBucket.get(bucket) ?? 0,
+      refundsByBucket.get(bucket) ?? 0
     );
     return { bucket, grossCents, netCents };
   });
@@ -508,7 +564,7 @@ function getCourseProgressSummary(courseId: number): CourseProgressSummary {
         inArray(lessonProgress.lessonId, courseLessonIds(courseId))
       )
     )
-    .where(eq(enrollments.courseId, courseId))
+    .where(and(eq(enrollments.courseId, courseId), isActiveEnrollment()))
     .groupBy(enrollments.userId)
     .all();
 
@@ -546,7 +602,7 @@ function getCourseDropOff(courseId: number): CourseFunnel {
   const enrolled = db
     .select({ enrolledCount: countDistinct(enrollments.userId) })
     .from(enrollments)
-    .where(eq(enrollments.courseId, courseId))
+    .where(and(eq(enrollments.courseId, courseId), isActiveEnrollment()))
     .get();
 
   const enrolledCount = enrolled?.enrolledCount ?? 0;
@@ -583,7 +639,8 @@ function getCourseDropOff(courseId: number): CourseFunnel {
       enrollments,
       and(
         eq(enrollments.userId, lessonProgress.userId),
-        eq(enrollments.courseId, courseId)
+        eq(enrollments.courseId, courseId),
+        isActiveEnrollment()
       )
     )
     .where(
@@ -896,9 +953,20 @@ export async function loader({ request, url }: Route.LoaderArgs) {
     .where(purchaseScope(instructorId, range))
     .get();
 
+  const refundRow = db
+    .select({ refunded: sum(refunds.amountRefunded) })
+    .from(refunds)
+    .innerJoin(purchases, eq(refunds.purchaseId, purchases.id))
+    .innerJoin(courses, eq(purchases.courseId, courses.id))
+    .where(approvedRefundScope(instructorId, range))
+    .get();
+
   // sum() returns null over an empty set, and a string when SQLite has rows.
   const summary: RevenueSummary = {
-    ...splitRevenue(Number(summaryRow?.gross ?? 0)),
+    ...splitRevenueAfterRefunds(
+      Number(summaryRow?.gross ?? 0),
+      Number(refundRow?.refunded ?? 0)
+    ),
     purchaseCount: summaryRow?.purchaseCount ?? 0,
   };
 
@@ -917,11 +985,49 @@ export async function loader({ request, url }: Route.LoaderArgs) {
     .groupBy(courses.id)
     .all();
 
-  const courseRevenue = courseRevenueRows
-    .map((row) => ({
-      courseId: row.courseId,
+  const courseRefundRows = db
+    .select({
+      courseId: courses.id,
+      title: courses.title,
+      refunded: sum(refunds.amountRefunded),
+    })
+    .from(refunds)
+    .innerJoin(purchases, eq(refunds.purchaseId, purchases.id))
+    .innerJoin(courses, eq(purchases.courseId, courses.id))
+    .where(approvedRefundScope(instructorId, range))
+    .groupBy(courses.id)
+    .all();
+
+  // A course refunded in the range but with no sales in it still appears, so
+  // the table adds up to the summary cards.
+  const courseTotals = new Map<
+    number,
+    { title: string; gross: number; refunded: number; purchaseCount: number }
+  >();
+  for (const row of courseRevenueRows) {
+    courseTotals.set(row.courseId, {
       title: row.title,
-      ...splitRevenue(Number(row.gross ?? 0)),
+      gross: Number(row.gross ?? 0),
+      refunded: 0,
+      purchaseCount: row.purchaseCount,
+    });
+  }
+  for (const row of courseRefundRows) {
+    const existing = courseTotals.get(row.courseId) ?? {
+      title: row.title,
+      gross: 0,
+      refunded: 0,
+      purchaseCount: 0,
+    };
+    existing.refunded = Number(row.refunded ?? 0);
+    courseTotals.set(row.courseId, existing);
+  }
+
+  const courseRevenue = [...courseTotals.entries()]
+    .map(([courseId, row]) => ({
+      courseId,
+      title: row.title,
+      ...splitRevenueAfterRefunds(row.gross, row.refunded),
       purchaseCount: row.purchaseCount,
     }))
     .sort((a, b) => b.grossCents - a.grossCents);
@@ -1631,7 +1737,7 @@ export default function InstructorAnalytics({
           </TabsList>
 
           <TabsContent value="overview" className="space-y-6">
-            <div className="grid gap-4 sm:grid-cols-3">
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
               <MoneyCard
                 label="Gross revenue"
                 amountCents={summary.grossCents}
@@ -1640,14 +1746,19 @@ export default function InstructorAnalytics({
                 }.`}
               />
               <MoneyCard
+                label="Refunds"
+                amountCents={summary.refundsCents}
+                hint="Refunds Approved in this period, whenever the sale was."
+              />
+              <MoneyCard
                 label={`Platform fee (${PLATFORM_FEE_PERCENT}%)`}
                 amountCents={summary.feeCents}
-                hint="Cadence's cut. Already deducted from your earnings."
+                hint="Cadence's cut, less its share of refunds. Already deducted from your earnings."
               />
               <MoneyCard
                 label="Your net earnings"
                 amountCents={summary.netCents}
-                hint="What you keep — gross revenue minus the platform fee."
+                hint="What you keep — gross revenue minus the platform fee, less your share of refunds."
                 emphasis
               />
             </div>
@@ -1849,6 +1960,7 @@ export default function InstructorAnalytics({
                         <th className="pb-2 font-medium">Course</th>
                         <th className="pb-2 text-right font-medium">Sales</th>
                         <th className="pb-2 text-right font-medium">Gross</th>
+                        <th className="pb-2 text-right font-medium">Refunds</th>
                         <th className="pb-2 text-right font-medium">
                           Fee ({PLATFORM_FEE_PERCENT}%)
                         </th>
@@ -1864,6 +1976,11 @@ export default function InstructorAnalytics({
                           </td>
                           <td className="py-3 text-right tabular-nums">
                             {formatMoney(course.grossCents)}
+                          </td>
+                          <td className="py-3 text-right tabular-nums text-muted-foreground">
+                            {course.refundsCents > 0
+                              ? `−${formatMoney(course.refundsCents)}`
+                              : formatMoney(0)}
                           </td>
                           <td className="py-3 text-right tabular-nums text-muted-foreground">
                             {formatMoney(course.feeCents)}
